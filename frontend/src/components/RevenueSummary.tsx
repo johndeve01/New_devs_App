@@ -3,9 +3,28 @@ import { SecureAPI } from '../lib/secureApi';
 
 interface RevenueData {
     property_id: string;
-    total_revenue: number;
+    /** Decimal-safe string from API (number retained for backward compatibility). */
+    total_revenue: string | number;
     currency: string;
     reservations_count: number;
+}
+
+/**
+ * Round money to 2 decimal places using integer cents to avoid float drift.
+ * Matches prior Math.round(x * 100) / 100 display convention.
+ */
+function roundMoneyToCents(value: string | number): number {
+    const raw = typeof value === 'number' ? value.toFixed(8) : String(value).trim();
+    const match = raw.match(/^(-?)(\d+)(?:\.(\d+))?$/);
+    if (!match) return 0;
+    const sign = match[1] ? -1 : 1;
+    const whole = parseInt(match[2], 10);
+    const frac = (match[3] || '').padEnd(3, '0').slice(0, 3);
+    let cents = whole * 100 + parseInt(frac.slice(0, 2), 10);
+    if (parseInt(frac[2], 10) >= 5) {
+        cents += 1;
+    }
+    return sign * (cents / 100);
 }
 
 interface RevenueSummaryProps {
@@ -61,7 +80,7 @@ export const RevenueSummary: React.FC<RevenueSummaryProps> = ({ propertyId = 'pr
     if (error) return <div className="p-4 text-red-500 bg-red-50 rounded-lg">{error}</div>;
     if (!data) return null;
 
-    const displayTotal = Math.round(data.total_revenue * 100) / 100;
+    const displayTotal = roundMoneyToCents(data.total_revenue);
 
     return (
         <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden hover:shadow-md transition-shadow duration-300">
@@ -104,7 +123,7 @@ export const RevenueSummary: React.FC<RevenueSummaryProps> = ({ propertyId = 'pr
 
                 {/* Precision Warning Area */}
                 <div className="mt-4 h-6">
-                    {Math.abs(data.total_revenue - displayTotal) > 0.000001 && showRaw && (
+                    {Math.abs(roundMoneyToCents(data.total_revenue) - displayTotal) > 0.000001 && showRaw && (
                         <div className="flex items-center text-xs text-amber-600 bg-amber-50 px-2 py-1 rounded">
                             <svg className="h-4 w-4 mr-1.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
