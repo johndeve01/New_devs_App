@@ -32,10 +32,15 @@ def _login(email: str, password: str) -> str:
     return r.json()["access_token"]
 
 
-def _summary(token: str, property_id: str, month: int = 3, year: int = 2024):
+def _summary(token: str, property_id: str, month: int | None = 3, year: int | None = 2024):
+    params = {"property_id": property_id}
+    if month is not None:
+        params["month"] = month
+    if year is not None:
+        params["year"] = year
     r = httpx.get(
         f"{API_BASE}/api/v1/dashboard/summary",
-        params={"property_id": property_id, "month": month, "year": year},
+        params=params,
         headers={"Authorization": f"Bearer {token}"},
         timeout=10.0,
     )
@@ -99,3 +104,24 @@ class TestDecimalPrecisionAPI:
         data = _summary(token_a, "prop-002")
         assert data["total_revenue"] == "4975.500"
         assert isinstance(data["total_revenue"], str)
+
+
+class TestReportingPeriodDefaults:
+    def test_omitting_month_year_returns_all_time_not_hardcoded_march(self):
+        """Default contract: no period filter (all-time). Seed still totals 2250 for prop-001."""
+        token_a = _login("sunset@propertyflow.com", "client_a_2024")
+        data = _summary(token_a, "prop-001", month=None, year=None)
+        assert data["total_revenue"] == "2250.000"
+        assert data["reservations_count"] == 4
+        assert "month" not in data
+        assert "year" not in data
+
+    def test_partial_period_rejected(self):
+        token_a = _login("sunset@propertyflow.com", "client_a_2024")
+        r = httpx.get(
+            f"{API_BASE}/api/v1/dashboard/summary",
+            params={"property_id": "prop-001", "month": 3},
+            headers={"Authorization": f"Bearer {token_a}"},
+            timeout=10.0,
+        )
+        assert r.status_code == 400

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
@@ -6,10 +6,14 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import text
 
 
+class RevenueDataAccessError(RuntimeError):
+    """Raised when revenue cannot be loaded due to infrastructure/DB failure."""
+
+
 def _month_bounds_utc(year: int, month: int, timezone_name: str) -> tuple[datetime, datetime]:
     """
-    Build [start, end) month bounds in the property's local timezone, returned as
-    timezone-aware datetimes (safe to compare with timestamptz check_in_date).
+    Build [start, end) month bounds in the property's local timezone, then convert
+    both endpoints to UTC for timestamptz filtering.
     """
     tz = ZoneInfo(timezone_name)
     start_local = datetime(year, month, 1, 0, 0, 0, tzinfo=tz)
@@ -17,7 +21,7 @@ def _month_bounds_utc(year: int, month: int, timezone_name: str) -> tuple[dateti
         end_local = datetime(year, month + 1, 1, 0, 0, 0, tzinfo=tz)
     else:
         end_local = datetime(year + 1, 1, 1, 0, 0, 0, tzinfo=tz)
-    return start_local, end_local
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
 
 def _empty_revenue(property_id: str, tenant_id: str) -> Dict[str, Any]:
@@ -81,7 +85,7 @@ async def calculate_monthly_revenue_summary(
         await db_pool.initialize()
 
         if not db_pool.session_factory:
-            raise Exception("Database pool not available")
+            raise RevenueDataAccessError("Database pool not available")
 
         async with db_pool.get_session() as session:
             timezone_name = await _get_property_timezone(session, property_id, tenant_id)
@@ -122,10 +126,11 @@ async def calculate_monthly_revenue_summary(
                 "count": count,
             }
 
+    except RevenueDataAccessError:
+        raise
     except Exception as e:
         print(f"Database error for {property_id} (tenant: {tenant_id}) monthly: {e}")
-        # Do not invent cross-tenant mock figures on failure.
-        return _empty_revenue(property_id, tenant_id)
+        raise RevenueDataAccessError(f"Failed to load monthly revenue for {property_id}") from e
 
 
 async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str, Any]:
@@ -138,7 +143,7 @@ async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str,
         await db_pool.initialize()
 
         if not db_pool.session_factory:
-            raise Exception("Database pool not available")
+            raise RevenueDataAccessError("Database pool not available")
 
         async with db_pool.get_session() as session:
             # Ensure the property belongs to this tenant before aggregating.
@@ -169,7 +174,8 @@ async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str,
                 "count": count,
             }
 
+    except RevenueDataAccessError:
+        raise
     except Exception as e:
         print(f"Database error for {property_id} (tenant: {tenant_id}): {e}")
-        # Fail closed: never return another tenant's figures from a shared mock map.
-        return _empty_revenue(property_id, tenant_id)
+        raise RevenueDataAccessError(f"Failed to load revenue for {property_id}") from e

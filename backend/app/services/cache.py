@@ -10,9 +10,11 @@ redis_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:63
 
 def _revenue_cache_key(tenant_id: str, property_id: str, month: Optional[int], year: Optional[int]) -> str:
     """Cache keys must include tenant (and period) to prevent cross-tenant leakage."""
+    if (month is None) ^ (year is None):
+        raise ValueError("month and year must both be set or both be omitted")
     if month is not None and year is not None:
         return f"revenue:{tenant_id}:{property_id}:{year}:{month:02d}"
-    return f"revenue:{tenant_id}:{property_id}"
+    return f"revenue:{tenant_id}:{property_id}:all"
 
 
 async def get_revenue_summary(
@@ -32,6 +34,7 @@ async def get_revenue_summary(
         return json.loads(cached)
 
     # Revenue calculation is delegated to the reservation service.
+    # Errors from the DB layer propagate — do not cache failure placeholders.
     from app.services.reservations import calculate_monthly_revenue_summary, calculate_total_revenue
 
     if month is not None and year is not None:
@@ -39,7 +42,7 @@ async def get_revenue_summary(
     else:
         result = await calculate_total_revenue(property_id, tenant_id)
 
-    # Cache the result for 5 minutes
+    # Cache successful results only (including legitimate zero totals) for 5 minutes
     await redis_client.setex(cache_key, 300, json.dumps(result))
 
     return result

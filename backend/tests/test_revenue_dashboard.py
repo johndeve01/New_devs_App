@@ -5,14 +5,20 @@ Focused regression tests for Property Revenue Dashboard bugs:
   C) Decimal money precision (no float drift)
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from app.services.cache import _revenue_cache_key
-from app.services.reservations import _month_bounds_utc, _quantize_money
+from app.services.reservations import (
+    RevenueDataAccessError,
+    _month_bounds_utc,
+    _quantize_money,
+    calculate_total_revenue,
+)
 
 
 class TestCacheKeyTenantIsolation:
@@ -30,8 +36,28 @@ class TestCacheKeyTenantIsolation:
             "tenant-b", "prop-001", None, None
         )
 
+    def test_period_and_all_time_keys_do_not_collide(self):
+        period = _revenue_cache_key("tenant-a", "prop-001", 3, 2024)
+        all_time = _revenue_cache_key("tenant-a", "prop-001", None, None)
+        assert period != all_time
+        assert all_time.endswith(":all")
+
+    def test_partial_period_rejected(self):
+        with pytest.raises(ValueError):
+            _revenue_cache_key("tenant-a", "prop-001", 3, None)
+        with pytest.raises(ValueError):
+            _revenue_cache_key("tenant-a", "prop-001", None, 2024)
+
 
 class TestMonthBoundaryTimezone:
+    def test_bounds_are_utc(self):
+        start, end = _month_bounds_utc(2024, 3, "Europe/Paris")
+        assert start.tzinfo == timezone.utc
+        assert end.tzinfo == timezone.utc
+        # Paris CET (+01) on Mar 1 → 23:00 UTC previous day; Apr 1 is CEST (+02)
+        assert start == datetime(2024, 2, 29, 23, 0, tzinfo=timezone.utc)
+        assert end == datetime(2024, 3, 31, 22, 0, tzinfo=timezone.utc)
+
     def test_paris_march_includes_utc_feb29_2330(self):
         """
         Seed res-tz-1: 2024-02-29 23:30:00+00 == 2024-03-01 00:30 Europe/Paris.
@@ -50,17 +76,34 @@ class TestMonthBoundaryTimezone:
         check_in = datetime(2024, 2, 29, 23, 30, tzinfo=ZoneInfo("UTC"))
         assert not (start <= check_in < end)
 
+    def test_dst_transition_reflected_in_utc_end_bound(self):
+        """March→April 2024 crosses DST in Paris and New York; UTC end offset changes."""
+        from datetime import timedelta
+
+        paris_start, paris_end = _month_bounds_utc(2024, 3, "Europe/Paris")
+        ny_start, ny_end = _month_bounds_utc(2024, 3, "America/New_York")
+        # Spring-forward: local March wall-time is 31 days, UTC span is 31d - 1h.
+        one_dst_month = timedelta(days=31) - timedelta(hours=1)
+        assert paris_end - paris_start == one_dst_month
+        assert ny_end - ny_start == one_dst_month
+        assert paris_start.hour == 23 and paris_end.hour == 22  # CET→CEST
+        assert ny_start.hour == 5 and ny_end.hour == 4  # EST→EDT
+
+    def test_december_year_rollover(self):
+        start, end = _month_bounds_utc(2024, 12, "Europe/Paris")
+        assert start == datetime(2024, 11, 30, 23, 0, tzinfo=timezone.utc)
+        assert end == datetime(2024, 12, 31, 23, 0, tzinfo=timezone.utc)
+
     def test_naive_utc_march_bounds_would_exclude_paris_edge_case(self):
         """Documents the original bug: naive UTC month start excludes Paris-local March 1."""
         naive_start = datetime(2024, 3, 1)
         check_in_utc = datetime(2024, 2, 29, 23, 30)
-        # Naive comparison as the old code did — incorrectly excludes the booking.
         assert not (check_in_utc >= naive_start)
 
     def test_month_end_exclusive(self):
         start, end = _month_bounds_utc(2024, 3, "UTC")
-        assert start == datetime(2024, 3, 1, 0, 0, tzinfo=ZoneInfo("UTC"))
-        assert end == datetime(2024, 4, 1, 0, 0, tzinfo=ZoneInfo("UTC"))
+        assert start == datetime(2024, 3, 1, 0, 0, tzinfo=timezone.utc)
+        assert end == datetime(2024, 4, 1, 0, 0, tzinfo=timezone.utc)
 
 
 class TestFinancialPrecision:
@@ -75,12 +118,22 @@ class TestFinancialPrecision:
         assert _quantize_money(Decimal("0.1") + Decimal("0.2")) == "0.300"
 
 
+class TestDatabaseFailureBehavior:
+    @pytest.mark.asyncio
+    async def test_db_failure_does_not_return_zero_revenue(self):
+        fake_pool = AsyncMock()
+        fake_pool.initialize = AsyncMock()
+        fake_pool.session_factory = None  # simulates pool init failure
+
+        with patch("app.core.database_pool.db_pool", fake_pool):
+            with pytest.raises(RevenueDataAccessError):
+                await calculate_total_revenue("prop-001", "tenant-a")
+
+
 @pytest.mark.asyncio
 async def test_monthly_revenue_prop001_tenant_a_includes_tz_edge(monkeypatch):
     """
-    Integration-style unit test with a stubbed DB session is heavy; instead verify
-    month bounds + expected seed math for March Paris prop-001.
-    Expected: 1250 + 333.333 + 333.333 + 333.334 = 2250.000
+    Expected March Paris prop-001: 1250 + 333.333 + 333.333 + 333.334 = 2250.000
     """
     expected = Decimal("1250.000") + Decimal("333.333") + Decimal("333.333") + Decimal("333.334")
     assert _quantize_money(expected) == "2250.000"
